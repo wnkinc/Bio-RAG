@@ -85,7 +85,7 @@ for i, az in enumerate(azs, start=1):
 aws.ec2.VpcEndpoint(
     "s3-gateway-endpoint",
     vpc_id=vpc.id,
-    service_name=f"com.amazonaws.{region.name}.s3",
+    service_name=f"com.amazonaws.{region.region}.s3",
     vpc_endpoint_type="Gateway",
     route_table_ids=[public_rt.id, private_rt.id],
     tags={"Name": f"{project}-{stack}-s3-endpoint"},
@@ -187,9 +187,9 @@ for name, sg in [("app-sg", app_sg), ("reranker-sg", reranker_sg)]:
 # ------------------------
 # S3 Bucket + Object (artifact uploaded by Pulumi)
 # ------------------------
-bucket = aws.s3.BucketV2(
+bucket = aws.s3.Bucket(
     "pubmed-bucket",
-    bucket=f"{project}-{stack}-pubmed".lower(),  # NOTE: global uniqueness required
+    bucket=f"{project}-{stack}-pubmed".lower(),
     tags={"Name": f"{project}-{stack}-pubmed"},
 )
 
@@ -268,7 +268,7 @@ aws.iam.RolePolicyAttachment(
     policy_arn="arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess",
 )
 
-domain_arn = f"arn:aws:es:{region.name}:{identity.account_id}:domain/{domain_name}"
+domain_arn = f"arn:aws:es:{region.region}:{identity.account_id}:domain/{domain_name}"
 aws.iam.RolePolicy(
     "ec2-os-http",
     role=ec2_role.id,
@@ -310,18 +310,20 @@ os_domain = aws.opensearch.Domain(
     domain_endpoint_options=aws.opensearch.DomainDomainEndpointOptionsArgs(
         enforce_https=True, tls_security_policy="Policy-Min-TLS-1-2-2019-07"
     ),
-    access_policies=json.dumps(
-        {
-            "Version": "2012-10-17",
-            "Statement": [
-                {
-                    "Effect": "Allow",
-                    "Principal": {"AWS": ec2_role.arn},
-                    "Action": "es:*",
-                    "Resource": f"{domain_arn}/*",
-                }
-            ],
-        }
+    access_policies=ec2_role.arn.apply(
+        lambda arn: json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": {"AWS": arn},
+                        "Action": "es:*",
+                        "Resource": f"{domain_arn}/*",
+                    }
+                ],
+            }
+        )
     ),
     tags={"Name": f"{project}-{stack}-os"},
 )
