@@ -294,12 +294,12 @@ instance_profile = aws.iam.InstanceProfile("ec2-instance-profile", role=ec2_role
 os_domain = aws.opensearch.Domain(
     "opensearch",
     domain_name=domain_name,
-    engine_version="OpenSearch_2.13",
+    engine_version="OpenSearch_3.1",
     cluster_config=aws.opensearch.DomainClusterConfigArgs(
         instance_type="t3.small.search", instance_count=1
     ),
     ebs_options=aws.opensearch.DomainEbsOptionsArgs(
-        ebs_enabled=True, volume_size=10, volume_type="gp2"
+        ebs_enabled=True, volume_size=10, volume_type="gp3"
     ),
     vpc_options=aws.opensearch.DomainVpcOptionsArgs(
         security_group_ids=[opensearch_sg.id],
