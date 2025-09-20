@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+.env
+
+# VS Code
+.vscode/
+
+# Infra virtualenv
+infra/venv/
+
+# Artifacts & large local assets (do NOT commit)
+infra/artifacts/
+reranker/wheels/
+reranker/model/
+*.tar.gz
+*.zip
+
+# OS cruft
+.DS_Store

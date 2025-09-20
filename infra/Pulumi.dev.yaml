@@ -1,2 +1,8 @@
 config:
-  aws:region: us-east-1
+  aws:region: us-east-1 # your AWS region
+  bio-rag-infra:vpcCidr: 10.0.0.0/16
+  bio-rag-infra:appPort: 8000 # port your LangChain app listens on
+  bio-rag-infra:rerankerPort: 9000 # port your reranker listens on
+  bio-rag-infra:opensearchDomainName: bio-rag-os
+  # Optional: restrict SSH to your IP (or leave unset to DISABLE SSH ingress)
+  # bio-rag-infra:allowedSshCidr: 203.0.113.4/32
