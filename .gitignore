@@ -10,6 +10,7 @@ venv/
 
 # VS Code
 .vscode/
+Bio-RAG.code-workspace
 
 # Infra virtualenv
 infra/venv/

@@ -410,6 +410,9 @@ app_instance = aws.ec2.Instance(
     iam_instance_profile=instance_profile.name,
     user_data=app_user_data,
     key_name=key_name,
+    root_block_device=aws.ec2.InstanceRootBlockDeviceArgs(
+        volume_size=8,  # 8 GiB
+    ),
     tags={"Name": f"{project}-{stack}-app"},
 )
 
@@ -425,10 +428,13 @@ reranker_instance = aws.ec2.Instance(
     iam_instance_profile=instance_profile.name,
     user_data=reranker_user_data,  # uses the uploaded S3 object
     key_name=key_name,  # SSH via jump host (app)
-    # Ensure instance waits for the artifact to exist (implicit via user_data ref, but be explicit)
+    root_block_device=aws.ec2.InstanceRootBlockDeviceArgs(
+        volume_size=8,  # 8 GiB
+    ),
     opts=pulumi.ResourceOptions(depends_on=[artifact_obj]),
     tags={"Name": f"{project}-{stack}-reranker"},
 )
+
 
 # ------------------------
 # Outputs
