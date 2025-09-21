@@ -1,0 +1,4 @@
+[submodule "langchain-app"]
+	path = langchain-app
+	url = https://github.com/wnkinc/langchain-app.git
+	branch = main
