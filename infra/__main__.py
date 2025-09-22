@@ -239,6 +239,74 @@ artifact_obj = aws.s3.BucketObjectv2(
 )
 
 # ------------------------
+# Chainlit storage bucket (S3)
+# ------------------------
+chainlit_bucket = aws.s3.Bucket(
+    "chainlit-bucket",
+    bucket=f"{project}-{stack}-chainlit".lower(),
+    tags={"Name": f"{project}-{stack}-chainlit"},
+)
+
+aws.s3.BucketPublicAccessBlock(
+    "chainlit-bucket-pab",
+    bucket=chainlit_bucket.id,
+    block_public_acls=True,
+    block_public_policy=True,
+    restrict_public_buckets=True,
+    ignore_public_acls=True,
+)
+
+aws.s3.BucketPolicy(
+    "chainlit-bucket-policy",
+    bucket=chainlit_bucket.id,
+    policy=chainlit_bucket.id.apply(
+        lambda bname: json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Sid": "DenyInsecureTransport",
+                        "Effect": "Deny",
+                        "Principal": "*",
+                        "Action": "s3:*",
+                        "Resource": [
+                            f"arn:aws:s3:::{bname}",
+                            f"arn:aws:s3:::{bname}/*",
+                        ],
+                        "Condition": {"Bool": {"aws:SecureTransport": "false"}},
+                    }
+                ],
+            }
+        )
+    ),
+)
+
+# ------------------------
+# Chainlit persistence (DynamoDB)
+# ------------------------
+chainlit_table = aws.dynamodb.Table(
+    "chainlit-table",
+    attributes=[
+        aws.dynamodb.TableAttributeArgs(name="PK", type="S"),
+        aws.dynamodb.TableAttributeArgs(name="SK", type="S"),
+        aws.dynamodb.TableAttributeArgs(name="UserThreadPK", type="S"),
+        aws.dynamodb.TableAttributeArgs(name="UserThreadSK", type="S"),
+    ],
+    hash_key="PK",
+    range_key="SK",
+    billing_mode="PAY_PER_REQUEST",
+    global_secondary_indexes=[
+        aws.dynamodb.TableGlobalSecondaryIndexArgs(
+            name="UserThread",
+            hash_key="UserThreadPK",
+            range_key="UserThreadSK",
+            projection_type="ALL",
+        )
+    ],
+    tags={"Name": f"{project}-{stack}-chainlit"},
+)
+
+# ------------------------
 # IAM Role & Profile
 # ------------------------
 ec2_role = aws.iam.Role(
@@ -287,6 +355,73 @@ aws.iam.RolePolicy(
 )
 
 instance_profile = aws.iam.InstanceProfile("ec2-instance-profile", role=ec2_role.name)
+
+# ------------------------
+# IAM: App EC2 needs RW to Chainlit bucket + DynamoDB table
+# ------------------------
+
+# S3 RW (object + list) on the Chainlit bucket only
+aws.iam.RolePolicy(
+    "ec2-chainlit-s3rw",
+    role=ec2_role.id,
+    policy=chainlit_bucket.bucket.apply(
+        lambda bname: json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Sid": "ListBucket",
+                        "Effect": "Allow",
+                        "Action": ["s3:ListBucket"],
+                        "Resource": [f"arn:aws:s3:::{bname}"],
+                    },
+                    {
+                        "Sid": "ObjectRW",
+                        "Effect": "Allow",
+                        "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+                        "Resource": [f"arn:aws:s3:::{bname}/*"],
+                    },
+                ],
+            }
+        )
+    ),
+)
+
+# DynamoDB RW on the Chainlit table + its indexes
+aws.iam.RolePolicy(
+    "ec2-chainlit-dynamodb",
+    role=ec2_role.id,
+    policy=chainlit_table.arn.apply(
+        lambda t_arn: json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Sid": "RWTable",
+                        "Effect": "Allow",
+                        "Action": [
+                            "dynamodb:PutItem",
+                            "dynamodb:GetItem",
+                            "dynamodb:UpdateItem",
+                            "dynamodb:DeleteItem",
+                            "dynamodb:BatchWriteItem",
+                            "dynamodb:Query",
+                            "dynamodb:Scan",
+                            "dynamodb:DescribeTable",
+                        ],
+                        "Resource": [t_arn],
+                    },
+                    {
+                        "Sid": "QueryGSIs",
+                        "Effect": "Allow",
+                        "Action": ["dynamodb:Query", "dynamodb:Scan"],
+                        "Resource": [f"{t_arn}/index/*"],
+                    },
+                ],
+            }
+        )
+    ),
+)
 
 # ------------------------
 # OpenSearch Free Tier
@@ -446,3 +581,5 @@ pulumi.export("rerankerPrivateIp", reranker_instance.private_ip)
 pulumi.export("s3Bucket", bucket.bucket)
 pulumi.export("artifactKey", artifact_key)
 pulumi.export("openSearchEndpoint", os_domain.endpoint)
+pulumi.export("chainlitBucket", chainlit_bucket.bucket)
+pulumi.export("chainlitTable", chainlit_table.name)
