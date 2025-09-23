@@ -2,6 +2,9 @@ import json
 import pulumi
 import pulumi_aws as aws
 
+import textwrap
+import pulumi_aws_native as aws_native
+
 # ------------------------
 # Config & helpers
 # ------------------------
@@ -183,6 +186,30 @@ for name, sg in [("app-sg", app_sg), ("reranker-sg", reranker_sg)]:
         to_port=443,
         source_security_group_id=sg.id,
     )
+
+# SG for OSI ENIs
+osis_sg = aws.ec2.SecurityGroup(
+    "osis-sg",
+    vpc_id=vpc.id,
+    description="OSI pipeline ENIs",
+    egress=[
+        aws.ec2.SecurityGroupEgressArgs(
+            protocol="-1", from_port=0, to_port=0, cidr_blocks=["0.0.0.0/0"]
+        )
+    ],
+    tags={"Name": f"{project}-{stack}-osis-sg"},
+)
+
+# Let OSI -> OpenSearch (443)
+aws.ec2.SecurityGroupRule(
+    "os-from-osis",
+    type="ingress",
+    security_group_id=opensearch_sg.id,  # domain's SG
+    protocol="tcp",
+    from_port=443,
+    to_port=443,
+    source_security_group_id=osis_sg.id,  # OSI ENIs
+)
 
 # ------------------------
 # S3 Bucket + Object (artifact uploaded by Pulumi)
@@ -424,8 +451,98 @@ aws.iam.RolePolicy(
 )
 
 # ------------------------
+# IAM Role for OpenSearch Ingestion Pipeline
+# ------------------------
+osis_role = aws.iam.Role(
+    "osis-role",
+    assume_role_policy=json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"Service": "osis-pipelines.amazonaws.com"},
+                    "Action": "sts:AssumeRole",
+                }
+            ],
+        }
+    ),
+)
+
+# allow OSI to read from your pubmed bucket prefix
+aws.iam.RolePolicy(
+    "osis-s3-read",
+    role=osis_role.id,
+    policy=bucket.bucket.apply(
+        lambda bname: json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": ["s3:GetObject", "s3:ListBucket"],
+                        "Resource": [
+                            f"arn:aws:s3:::{bname}",
+                            f"arn:aws:s3:::{bname}/datasets/pubmed/*",
+                        ],
+                    }
+                ],
+            }
+        )
+    ),
+)
+
+# allow OSI to push into your OpenSearch domain + describe it
+aws.iam.RolePolicy(
+    "osis-os-http",
+    role=osis_role.id,
+    policy=pulumi.Output.all().apply(
+        lambda _: json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    # HTTP ops against data/indices
+                    {
+                        "Effect": "Allow",
+                        "Action": ["es:ESHttp*"],
+                        "Resource": [f"{domain_arn}/*"],
+                    },
+                    # Describe calls during pipeline startup (use wildcard to be safe)
+                    {
+                        "Effect": "Allow",
+                        "Action": [
+                            "es:DescribeDomain",
+                            "es:DescribeDomainConfig",
+                            "es:ListDomainNames",
+                        ],
+                        "Resource": ["*"],
+                    },
+                ],
+            }
+        )
+    ),
+)
+
+
+# ------------------------
 # OpenSearch Free Tier
 # ------------------------
+access_policy = pulumi.Output.all(ec2_arn=ec2_role.arn, osis_arn=osis_role.arn).apply(
+    lambda a: json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": [a["ec2_arn"], a["osis_arn"]]},
+                    "Action": "es:*",
+                    "Resource": f"{domain_arn}/*",
+                }
+            ],
+        }
+    )
+)
+
 os_domain = aws.opensearch.Domain(
     "opensearch",
     domain_name=domain_name,
@@ -434,7 +551,7 @@ os_domain = aws.opensearch.Domain(
         instance_type="t3.small.search", instance_count=1
     ),
     ebs_options=aws.opensearch.DomainEbsOptionsArgs(
-        ebs_enabled=True, volume_size=10, volume_type="gp3"
+        ebs_enabled=True, volume_size=20, volume_type="gp3"
     ),
     vpc_options=aws.opensearch.DomainVpcOptionsArgs(
         security_group_ids=[opensearch_sg.id],
@@ -445,23 +562,10 @@ os_domain = aws.opensearch.Domain(
     domain_endpoint_options=aws.opensearch.DomainDomainEndpointOptionsArgs(
         enforce_https=True, tls_security_policy="Policy-Min-TLS-1-2-2019-07"
     ),
-    access_policies=ec2_role.arn.apply(
-        lambda arn: json.dumps(
-            {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Principal": {"AWS": arn},
-                        "Action": "es:*",
-                        "Resource": f"{domain_arn}/*",
-                    }
-                ],
-            }
-        )
-    ),
+    access_policies=access_policy,  # <-- use the combined policy here
     tags={"Name": f"{project}-{stack}-os"},
 )
+
 
 # ------------------------
 # EC2 AMI
@@ -570,6 +674,67 @@ reranker_instance = aws.ec2.Instance(
     tags={"Name": f"{project}-{stack}-reranker"},
 )
 
+# ------------------------
+# OpenSearch Ingestion Pipeline (S3 -> OpenSearch)
+# ------------------------
+import textwrap
+
+pipeline_config = pulumi.Output.all(
+    bucket=bucket.bucket,
+    region_str=region.region,
+    endpoint=os_domain.endpoint,
+    role_arn=osis_role.arn,
+).apply(
+    lambda a: textwrap.dedent(
+        f"""
+    version: "2"
+    pubmed-pipeline:
+      source:
+        s3:
+          codec:
+            newline: {{}}          # newline-delimited JSON
+          compression: none
+          aws:
+            region: "{a['region_str']}"
+            sts_role_arn: "{a['role_arn']}"
+          scan:
+            buckets:
+              - bucket:
+                  name: "{a['bucket']}"
+                  filter:
+                    include_prefix:
+                      - "datasets/pubmed/"
+            scheduling:
+              interval: "PT15M"
+      processor:
+        - parse_json: {{}}
+      sink:
+        - opensearch:
+            hosts: ["https://{a['endpoint']}"]
+            aws:
+              region: "{a['region_str']}"
+              sts_role_arn: "{a['role_arn']}"
+            index: "pubmed-abstracts"
+            document_id: "${{/PMID}}"
+    """
+    )
+)
+
+aws_native_provider = aws_native.Provider("aws-native", region=region.region)
+
+osis_pipeline = aws_native.osis.Pipeline(
+    "pubmed-pipeline",
+    pipeline_name="pubmed-pipeline",
+    min_units=1,
+    max_units=1,
+    pipeline_configuration_body=pipeline_config,
+    vpc_options=aws_native.osis.PipelineVpcOptionsArgs(
+        subnet_ids=[private_subnets[0].id],
+        security_group_ids=[osis_sg.id],
+    ),
+    tags=[{"key": "Name", "value": f"{project}-{stack}-pubmed-pipeline"}],
+    opts=pulumi.ResourceOptions(provider=aws_native_provider),
+)
 
 # ------------------------
 # Outputs
