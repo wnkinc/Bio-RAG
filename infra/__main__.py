@@ -42,7 +42,9 @@ ingestion_enabled = bool(cfg.get_bool("ingestionEnabled") or False)
 # Baseline vs ingest-time domain sizing (overridable via Pulumi config)
 os_base_instance_type = cfg.get("osBaseInstanceType") or "t3.small.search"
 os_base_volume_gib = int(cfg.get("osBaseVolumeGiB") or 30)
-os_ingest_instance_type = cfg.get("osIngestInstanceType") or "t3.small.search"
+os_ingest_instance_type = (
+    cfg.get("osIngestInstanceType") or "t3.small.search"
+)  # could be r7g.large.search for bigger ingests
 os_ingest_volume_gib = int(cfg.get("osIngestVolumeGiB") or 30)
 os_instance_count = int(cfg.get("osInstanceCount") or 1)
 
@@ -789,7 +791,7 @@ if ingestion_enabled:
                 aws:
                   region: "{a['region_str']}"
                   sts_role_arn: "{a['role_arn']}"
-                index: "pubmed-abstracts"
+                index: "pubmed-abstracts-1p"
                 document_id: "${{/PMID}}"
                 bulk_size: {sink_bulk}
                 flush_timeout: {sink_flush_ms}
