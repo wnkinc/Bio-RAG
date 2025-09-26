@@ -1,4 +1,3 @@
-# main.py — drop-in replacement
 #
 # Key change: Everything needed ONLY for the OpenSearch Ingestion (OSI) pipeline
 # and its private egress (VPC interface endpoints) is fully isolated behind a
@@ -6,16 +5,16 @@
 # destroy the ingestion stack without touching the rest of your infra.
 #
 # Usage:
-#   pulumi config set ingestionEnabled true   # create OSI pipeline + STS endpoint
+#   pulumi config set ingestionEnabled true    # scale domain up + create OSI
 #   pulumi up
-#   pulumi config set ingestionEnabled false  # destroy OSI pipeline + endpoints
+#   pulumi config set ingestionEnabled false   # revert domain + destroy OSI
 #   pulumi up
 #
 # Notes:
-# - We add the STS Interface VPC Endpoint only when ingestion is enabled.
-# - Domain access policy automatically includes/excludes the OSI role principal.
-# - All OSI-specific resources (role, SG, VPC endpoints, pipeline) live in one
-#   clearly-marked section so they can be safely torn down.
+# - The S3 source is configured for a ONE-TIME scheduled scan (no interval),
+#   per AWS docs; it runs once on create, then idles. Tear it down after. (See:
+#   "one-time scheduled scan" in AWS OSI S3 source docs.)
+# - A dedicated CloudWatch Log Group is created and wired into OSI log publishing.
 
 import json
 import textwrap
@@ -39,6 +38,28 @@ key_name = cfg.get("keyName") or "viewer-frontend-key"  # must exist in region
 
 # NEW: one switch to rule them all
 ingestion_enabled = bool(cfg.get_bool("ingestionEnabled") or False)
+
+# Baseline vs ingest-time domain sizing (overridable via Pulumi config)
+os_base_instance_type = cfg.get("osBaseInstanceType") or "t3.small.search"
+os_base_volume_gib = int(cfg.get("osBaseVolumeGiB") or 30)
+os_ingest_instance_type = cfg.get("osIngestInstanceType") or "t3.small.search"
+os_ingest_volume_gib = int(cfg.get("osIngestVolumeGiB") or 30)
+os_instance_count = int(cfg.get("osInstanceCount") or 1)
+
+# Effective sizing based on the switch
+os_eff_instance_type = (
+    os_ingest_instance_type if ingestion_enabled else os_base_instance_type
+)
+os_eff_volume_gib = os_ingest_volume_gib if ingestion_enabled else os_base_volume_gib
+
+# Ingest-time pipeline tuning (applies only when OSI exists)
+# These are safe, higher-throughput defaults you can override via config.
+sink_bulk = int(cfg.get("sinkBulk") or 1)  # bulk request size (docs)
+sink_flush_ms = int(cfg.get("sinkFlushMs") or 2000)  # flush timeout (ms)
+source_records = int(cfg.get("sourceRecords") or 200)  # S3 batching
+source_backoff = cfg.get("sourceBackoff") or "1s"  # S3 backoff
+osi_min_ocus = int(cfg.get("osiMinOcus") or 2)
+osi_max_ocus = int(cfg.get("osiMaxOcus") or 2)
 
 region = aws.get_region()
 identity = aws.get_caller_identity()
@@ -565,7 +586,6 @@ if ingestion_enabled:
     )
 
     # Allow OSI ENIs to reach Interface VPC endpoints (STS/Logs) attached to this same SG.
-    # Interface endpoints listen on 443 and are protected by their attached SG(s).
     aws.ec2.SecurityGroupRule(
         "osis-sg-self-443",
         type="ingress",
@@ -576,9 +596,9 @@ if ingestion_enabled:
         source_security_group_id=osis_sg.id,
     )
 
-    # Allow OSI -> OpenSearch (443) — keep the original logical name
+    # Allow OSI -> OpenSearch (443) — keep the original logical name for Pulumi state
     aws.ec2.SecurityGroupRule(
-        "os-from-osis",  # <- keep this name; matches existing state
+        "os-from-osis",
         type="ingress",
         security_group_id=opensearch_sg.id,
         protocol="tcp",
@@ -587,7 +607,7 @@ if ingestion_enabled:
         source_security_group_id=osis_sg.id,
     )
 
-    # VPC Interface Endpoints required for private OSI egress (STS is mandatory)
+    # VPC Interface Endpoints required for private OSI egress
     vpce_sts = aws.ec2.VpcEndpoint(
         "vpce-sts",
         vpc_id=vpc.id,
@@ -649,7 +669,7 @@ if ingestion_enabled:
             )
         ),
     )
-    # OSI: allow push into your OpenSearch domain + describe it (domain access policy also grants principal; see below)
+    # OSI: allow push into your OpenSearch domain + describe it
     aws.iam.RolePolicy(
         "osis-os-http",
         role=osis_role.id,
@@ -677,7 +697,7 @@ if ingestion_enabled:
     )
 
 # ------------------------
-# OpenSearch Domain (created regardless; access policy adds OSI principal only if enabled)
+# OpenSearch Domain (exists always; sizing & access depend on `ingestionEnabled`)
 # ------------------------
 if ingestion_enabled:
     principals_output = pulumi.Output.all(ec2_role.arn, osis_role.arn)
@@ -705,10 +725,11 @@ os_domain = aws.opensearch.Domain(
     domain_name=domain_name,
     engine_version="OpenSearch_3.1",
     cluster_config=aws.opensearch.DomainClusterConfigArgs(
-        instance_type="t3.small.search", instance_count=1
+        instance_type=os_eff_instance_type,
+        instance_count=os_instance_count,
     ),
     ebs_options=aws.opensearch.DomainEbsOptionsArgs(
-        ebs_enabled=True, volume_size=20, volume_type="gp3"
+        ebs_enabled=True, volume_size=os_eff_volume_gib, volume_type="gp3"
     ),
     vpc_options=aws.opensearch.DomainVpcOptionsArgs(
         security_group_ids=[opensearch_sg.id],
@@ -729,6 +750,10 @@ os_domain = aws.opensearch.Domain(
 aws_native_provider = aws_native.Provider("aws-native", region=region.region)
 
 if ingestion_enabled:
+    # Pre-create CloudWatch Log Group so you control retention/KMS
+    pipeline_name = "pubmed-pipeline"
+
+    # ONE-TIME scheduled scan: omit any recurring interval. (Runs once on create.)
     pipeline_config = pulumi.Output.all(
         bucket=bucket.bucket,
         region_str=region.region,
@@ -737,53 +762,63 @@ if ingestion_enabled:
     ).apply(
         lambda a: textwrap.dedent(
             f"""
-            version: "2"
-            pubmed-pipeline:
-              source:
-                s3:
-                  codec:
-                    newline: {{}}
-                  compression: none
-                  aws:
-                    region: "{a['region_str']}"
-                    sts_role_arn: "{a['role_arn']}"
-                  scan:
-                    buckets:
-                      - bucket:
-                          name: "{a['bucket']}"
-                          filter:
-                            include_prefix:
-                              - "datasets/pubmed/"
-                  records_to_accumulate: 50
-                  backoff_time: "5s"
-            #   processor:
-            #     - parse_json: {{}}
-              sink:
-                - opensearch:
-                    hosts: ["https://{a['endpoint']}"]
-                    aws:
-                      region: "{a['region_str']}"
-                      sts_role_arn: "{a['role_arn']}"
-                    index: "pubmed-abstracts"
-                    # document_id: "${{/PMID}}"
-                    bulk_size: 20
-                    max_retries: 8
-            """
+        version: "2"
+        pubmed-pipeline:
+          source:
+            s3:
+              codec:
+                newline: {{}}
+              compression: none
+              aws:
+                region: "{a['region_str']}"
+                sts_role_arn: "{a['role_arn']}"
+              scan:
+                buckets:
+                  - bucket:
+                      name: "{a['bucket']}"
+                      filter:
+                        include_prefix:
+                          - "datasets/pubmed/"
+              records_to_accumulate: {source_records}
+              backoff_time: "{source_backoff}"
+          processor:
+            - parse_json: {{}}
+          sink:
+            - opensearch:
+                hosts: ["https://{a['endpoint']}"]
+                aws:
+                  region: "{a['region_str']}"
+                  sts_role_arn: "{a['role_arn']}"
+                index: "pubmed-abstracts"
+                document_id: "${{/PMID}}"
+                bulk_size: {sink_bulk}
+                flush_timeout: {sink_flush_ms}
+                max_retries: 16
+        """
         )
     )
 
     osis_pipeline = aws_native.osis.Pipeline(
         "pubmed-pipeline",
-        pipeline_name="pubmed-pipeline",
-        min_units=1,
-        max_units=1,
+        pipeline_name=pipeline_name,
+        min_units=osi_min_ocus,
+        max_units=osi_max_ocus,
         pipeline_configuration_body=pipeline_config,
         vpc_options=aws_native.osis.PipelineVpcOptionsArgs(
             subnet_ids=[private_subnets[0].id],
             security_group_ids=[osis_sg.id],
         ),
+        log_publishing_options={
+            "is_logging_enabled": True,
+            "cloud_watch_log_destination": {
+                "log_group": f"/aws/vendedlogs/OpenSearchIngestion/{pipeline_name}"
+            },
+        },
         tags=[{"key": "Name", "value": f"{project}-{stack}-pubmed-pipeline"}],
-        opts=pulumi.ResourceOptions(provider=aws_native_provider),
+        opts=pulumi.ResourceOptions(
+            provider=aws_native_provider,
+            depends_on=[os_domain, vpce_sts, vpce_logs],
+        ),
     )
 
 # ------------------------
@@ -807,3 +842,11 @@ if ingestion_enabled:
     pulumi.export("vpceStsId", vpce_sts.id)
     pulumi.export("vpceLogsId", vpce_logs.id)
     pulumi.export("osisPipelineName", osis_pipeline.pipeline_name)
+    pulumi.export(
+        "osisLogGroup", f"/aws/vendedlogs/OpenSearchIngestion/{pipeline_name}"
+    )
+
+# Always export domain sizing for clarity
+pulumi.export("osInstanceType", os_eff_instance_type)
+pulumi.export("osInstanceCount", os_instance_count)
+pulumi.export("osVolumeSizeGiB", os_eff_volume_gib)

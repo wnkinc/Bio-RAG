@@ -7,5 +7,5 @@ config:
   # Optional: restrict SSH to your IP (or leave unset to DISABLE SSH ingress)
   # bio-rag-infra:allowedSshCidr: 203.0.113.4/32
 
-  Bio-RAG:ingestionEnabled: "false"
+  Bio-RAG:ingestionEnabled: "true"
   Bio-RAG:allowedSshCidr: 172.223.229.75/32
