@@ -276,14 +276,14 @@ aws.s3.BucketPolicy(
 
 # Upload your local artifact to the bucket at a predictable key
 artifact_key = "reranker/releases/v1/reranker.tar.gz"
-artifact_obj = aws.s3.BucketObjectv2(
-    "reranker-artifact",
-    bucket=bucket.bucket,  # name, not ID
-    key=artifact_key,
-    source=pulumi.FileAsset("artifacts/reranker.tar.gz"),  # ensure this file exists
-    content_type="application/gzip",
-    server_side_encryption="AES256",
-)
+# artifact_obj = aws.s3.BucketObjectv2(
+#     "reranker-artifact",
+#     bucket=bucket.bucket,  # name, not ID
+#     key=artifact_key,
+#     source=pulumi.FileAsset("artifacts/reranker.tar.gz"),  # ensure this file exists
+#     content_type="application/gzip",
+#     server_side_encryption="AES256",
+# )
 
 # Chainlit storage bucket (S3)
 chainlit_bucket = aws.s3.Bucket(
@@ -495,20 +495,51 @@ systemctl enable --now amazon-ssm-agent || true
 APP_DIR=/opt/reranker
 ARTIFACT_S3=s3://{args['bucket_name']}/{args['key']}
 
-mkdir -p $APP_DIR
-cd $APP_DIR
+mkdir -p "$APP_DIR"
+cd "$APP_DIR"
 
+# Pull artifact and unpack
 aws s3 cp "$ARTIFACT_S3" ./reranker.tar.gz
 tar -xzf reranker.tar.gz
 
-python3 -m venv .venv
-source .venv/bin/activate
+# Ensure the runtime user can manage the venv & files (systemd User=ec2-user)
+chown -R ec2-user:ec2-user "$APP_DIR"
 
-# Optional: if you included prebuilt wheels and requirements.txt
-if [ -f wheels/INDEX ]; then
-  pip install --no-index --find-links file://$APP_DIR/wheels -r requirements.txt || true
+# Fully-offline bootstrap script (idempotent)
+mkdir -p "$APP_DIR/bin"
+cat >"$APP_DIR/bin/bootstrap.sh" <<'BOOT'
+#!/usr/bin/env bash
+set -euxo pipefail
+
+APP_DIR=/opt/reranker
+STAMP="$APP_DIR/.bootstrapped"
+WHEELHOUSE="file://$APP_DIR/wheels-linux"
+VENVDIR="$APP_DIR/.venv"
+
+# If already bootstrapped, do nothing
+if [[ -f "$STAMP" ]]; then
+  exit 0
 fi
 
+# Build venv
+python3 -m venv "$VENVDIR"
+
+# Offline pip configuration
+export PIP_NO_INDEX=1
+export PIP_FIND_LINKS="$WHEELHOUSE"
+export PIP_ONLY_BINARY=":all:"
+export PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Install strictly from local wheels; no builds, no internet
+"$VENVDIR/bin/pip" install --no-index --find-links "$WHEELHOUSE" \\
+  --only-binary=:all: --no-build-isolation \\
+  -r "$APP_DIR/requirements.txt"
+
+touch "$STAMP"
+BOOT
+chmod +x "$APP_DIR/bin/bootstrap.sh"
+
+# Systemd service
 cat >/etc/systemd/system/reranker.service <<'SERVICE'
 [Unit]
 Description=Reranker service
@@ -518,6 +549,7 @@ After=network-online.target
 Type=simple
 User=ec2-user
 WorkingDirectory=/opt/reranker
+ExecStartPre=/bin/bash -lc '/opt/reranker/bin/bootstrap.sh >> /opt/reranker/bootstrap.log 2>&1'
 ExecStart=/opt/reranker/.venv/bin/python -m reranker.server --port={args['port']}
 Restart=always
 RestartSec=5
@@ -530,6 +562,7 @@ systemctl daemon-reload
 systemctl enable --now reranker.service
 """
 )
+
 
 # ------------------------
 # EC2 Instances
@@ -559,8 +592,8 @@ reranker_instance = aws.ec2.Instance(
     iam_instance_profile=instance_profile.name,
     user_data=reranker_user_data,
     key_name=key_name,  # SSH via jump host (app)
-    root_block_device=aws.ec2.InstanceRootBlockDeviceArgs(volume_size=8),
-    opts=pulumi.ResourceOptions(depends_on=[artifact_obj]),
+    root_block_device=aws.ec2.InstanceRootBlockDeviceArgs(volume_size=20),
+    # opts=pulumi.ResourceOptions(depends_on=[artifact_obj]),
     tags={"Name": f"{project}-{stack}-reranker"},
 )
 

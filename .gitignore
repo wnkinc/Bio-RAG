@@ -8,6 +8,10 @@ __pycache__/
 venv/
 .env
 
+wheels/
+wheels-linux/
+model/
+
 # VS Code
 .vscode/
 Bio-RAG.code-workspace
