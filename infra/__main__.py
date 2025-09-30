@@ -291,6 +291,26 @@ chainlit_bucket = aws.s3.Bucket(
     bucket=f"{project}-{stack}-chainlit".lower(),
     tags={"Name": f"{project}-{stack}-chainlit"},
 )
+aws.s3.BucketCorsConfiguration(
+    "chainlit-bucket-cors",
+    bucket=chainlit_bucket.id,
+    cors_rules=[
+        aws.s3.BucketCorsRuleArgs(
+            allowed_methods=["GET", "HEAD"],  # <-- no OPTIONS here
+            allowed_origins=[
+                "https://app.authservices.cloud",
+                "https://api.authservices.cloud",
+                "http://34.236.43.171",
+                "http://localhost:8000",
+                "http://127.0.0.1:8000",
+            ],
+            allowed_headers=["*"],
+            expose_headers=["ETag", "Content-Length", "Content-Type"],
+            max_age_seconds=3600,
+        )
+    ],
+)
+
 aws.s3.BucketPublicAccessBlock(
     "chainlit-bucket-pab",
     bucket=chainlit_bucket.id,
