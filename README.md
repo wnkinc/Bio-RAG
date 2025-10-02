@@ -52,7 +52,7 @@ You can customize behavior via Pulumi configuration. Key config keys:
 | `osIngestVolumeGiB`    | `30`               | EBS volume size ingest mode                         |
 | _(others available)_   | _see infra code_   | Tuning knobs for bulk size, flush time, etc.        |
 
-See the [langchain-app](./langchain-app) submodule for the application code deployed onto the App EC2 instance.
+See the [langchain-app](https://github.com/wnkinc/langchain-app/tree/51b6c866f9a3415fbeb08dee84f60adbb3a95c97) submodule for the application code deployed onto the App EC2 instance.
 
 ### Deployment
 
