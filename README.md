@@ -26,6 +26,12 @@ The key modules and relationships:
 
 A core design decision: **everything needed for ingestion (OSI)** is isolated behind a **single config switch** (`ingestionEnabled`). Toggle it to deploy or tear down the ingestion pipeline without touching the rest.
 
+## 🎥 Demo
+
+Here’s Bio-RAG in action answering a biomedical question:
+
+![Bio-RAG Demo](./docs/demo.gif)
+
 ## 🔧 Usage & Deployment (Infra Focus)
 
 ### Configuration
